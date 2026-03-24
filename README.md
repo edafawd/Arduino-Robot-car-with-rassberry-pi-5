@@ -134,9 +134,6 @@ Plug the Arduino UNO into your computer (USB‑B cable).
 
 Download and install the Arduino IDE from https://www.arduino.cc if you don’t have it.
 
-In your browser, go to your GitHub repo:
-https://github.com/edafawd/Arduino-Robot-car-with-rassberry-pi-5
-
 Click on Arduino_uno_motor_controller.ino.
 
 Click “Raw”, then right‑click → “Save as” → save the file.
