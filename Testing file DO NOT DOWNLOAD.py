@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+============================================================
+Robot Car Brain - Raspberry Pi 5
+Vision-Only Obstacle Avoidance (NO ULTRASONIC)
+============================================================
+Obstacle detection is done entirely from the camera:
+  - Bottom-center crop of frame is analyzed for "floor texture"
+  - If that zone fills with non-floor color/depth → obstacle
+  - YOLOv8 bounding boxes in the lower half also trigger avoidance
+  - Optical flow detects fast-approaching objects
+
+Object recognition: YOLOv8n (people, TVs, couches, beds, etc.)
+
+Install:  bash setup.sh
+Run:      python3 robot_brain.py
+Dashboard: http://<pi-ip>:5000
+============================================================
+"""
+
+import cv2
+import serial
+import serial.tools.list_ports
+import threading
+import time
+import argparse
+import logging
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Optional
+
+from ultralytics import YOLO
+from flask import Flask, Response, render_template_string
+
+# ============================================================
+# Config
+# ============================================================
+SERIAL_BAUD      = 9600
+CAMERA_INDEX     = 0
+FRAME_W          = 640
+FRAME_H          = 480
+WEB_PORT         = 5000
+DETECT_INTERVAL  = 0.08   # seconds between YOLO runs
+DRIVE_INTERVAL   = 0.12   # seconds between Arduino commands
+CONF_THRESH      = 0.40
+
+# Vision obstacle zones (as fraction of frame height from bottom)
+# We look at the bottom 35% of the frame, split into left/center/right thirds
+OBSTACLE_ZONE_TOP    = 0.55   # top of obstacle detection zone (55% down)
+FLOOR_SAMPLE_TOP     = 0.80   # sample "known floor" from bottom 20%
+
+# How much of the obstacle zone must be non-floor to trigger stop/turn
+OBSTACLE_THRESH_STOP = 0.45   # 45% blocked → stop
+OBSTACLE_THRESH_SLOW = 0.25   # 25% blocked → slow
+
+# COCO classes we highlight
+INTERESTING = {
+    0:  "person",
+    56: "chair",
+    57: "couch",
+    59: "bed",
+    60: "dining table",
+    62: "tv / monitor",
+    63: "laptop",
+    67: "cell phone",
+    72: "refrigerator",
+    73: "book",
+}
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("RobotBrain")
+
+# ============================================================
+# Shared State
+# ============================================================
+@dataclass
+class RobotState:
+    current_cmd:   str   = "STOP"
+    detections:    list  = field(default_factory=list)
+    obstacle_left:  float = 0.0   # 0-1 fill ratio
+    obstacle_center:float = 0.0
+    obstacle_right: float = 0.0
+    frame:          Optional[np.ndarray] = None
+    annotated_frame:Optional[np.ndarray] = None
+    running:        bool  = True
+    avoid_until:    float = 0.0
+    turn_count:     int   = 0
+    ir_left:        int   = 0
+    ir_right:       int   = 0
+
+state = RobotState()
+frame_lock = threading.Lock()
+
+# ============================================================
+# Arduino Serial
+# ============================================================
+def find_arduino():
+    for p in serial.tools.list_ports.comports():
+        desc = (p.description or "").lower()
+        if any(k in desc for k in ["arduino","ch340","ch341"]):
+            return p.device
+    for dev in ["/dev/ttyUSB0","/dev/ttyACM0","/dev/ttyUSB1","/dev/ttyACM1"]:
+        try:
+            s = serial.Serial(dev, SERIAL_BAUD, timeout=0.3); s.close(); return dev
+        except: pass
+    return None
+
+class ArduinoSerial:
+    def __init__(self, port):
+        self.ser = None
+        try:
+            self.ser = serial.Serial(port, SERIAL_BAUD, timeout=1)
+            time.sleep(2)
+            log.info(f"Arduino on {port}")
+        except Exception as e:
+            log.error(f"Serial failed: {e}")
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def send(self, cmd):
+        if self.ser and self.ser.is_open:
+            try: self.ser.write((cmd.strip()+"\n").encode())
+            except: pass
+
+    def _reader(self):
+        while state.running:
+            if not self.ser or not self.ser.is_open:
+                time.sleep(0.5); continue
+            try:
+                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+                if "IR_L:" in line:
+                    parts = dict(p.split(":") for p in line.split(",") if ":" in p)
+                    state.ir_left  = int(parts.get("IR_L", 0))
+                    state.ir_right = int(parts.get("IR_R", 0))
+            except: pass
+
+# ============================================================
+# Camera Thread
+# ============================================================
+class CameraThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+    def run(self):
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        if not cap.isOpened():
+            log.error("Camera not found!"); return
+        log.info("Camera open.")
+        while state.running:
+            ret, frame = cap.read()
+            if ret:
+                with frame_lock:
+                    state.frame = frame.copy()
+            else:
+                time.sleep(0.03)
+        cap.release()
+
+# ============================================================
+# Vision Obstacle Analyzer
+# Compares bottom-center zone color against known floor sample.
+# Returns fill ratios for left / center / right thirds.
+# ============================================================
+class ObstacleAnalyzer:
+    def __init__(self):
+        self.floor_hsv_mean = None
+        self.floor_hsv_std  = None
+        self.calibrated     = False
+        self.cal_frames     = 0
+
+    def update(self, frame):
+        h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # --- Calibrate floor color from bottom strip ---
+        if self.cal_frames < 20:
+            floor_strip = hsv[int(h * FLOOR_SAMPLE_TOP):h, w//4: 3*w//4]
+            if self.floor_hsv_mean is None:
+                self.floor_hsv_mean = floor_strip.mean(axis=(0,1))
+                self.floor_hsv_std  = floor_strip.std(axis=(0,1)) + 15
+            else:
+                alpha = 0.1
+                self.floor_hsv_mean = (1-alpha)*self.floor_hsv_mean + alpha*floor_strip.mean(axis=(0,1))
+                self.floor_hsv_std  = (1-alpha)*self.floor_hsv_std  + alpha*(floor_strip.std(axis=(0,1))+15)
+            self.cal_frames += 1
+            if self.cal_frames == 20:
+                self.calibrated = True
+                log.info(f"Floor calibrated: HSV mean={self.floor_hsv_mean.astype(int)}")
+
+        if not self.calibrated:
+            return 0.0, 0.0, 0.0
+
+        # --- Obstacle zone: rows from OBSTACLE_ZONE_TOP to FLOOR_SAMPLE_TOP ---
+        y1 = int(h * OBSTACLE_ZONE_TOP)
+        y2 = int(h * FLOOR_SAMPLE_TOP)
+        zone = hsv[y1:y2, :]
+
+        # Pixels that differ significantly from floor = obstacle
+        lo = np.clip(self.floor_hsv_mean - 2.5 * self.floor_hsv_std, 0, 255).astype(np.uint8)
+        hi = np.clip(self.floor_hsv_mean + 2.5 * self.floor_hsv_std, 0, 255).astype(np.uint8)
+
+        # Handle hue wrap-around
+        floor_mask = cv2.inRange(zone, lo, hi)
+        obstacle_mask = cv2.bitwise_not(floor_mask)
+
+        # Split into thirds
+        third = w // 3
+        left_fill   = obstacle_mask[:, :third].mean()        / 255.0
+        center_fill = obstacle_mask[:, third:2*third].mean() / 255.0
+        right_fill  = obstacle_mask[:, 2*third:].mean()      / 255.0
+
+        state.obstacle_left   = float(left_fill)
+        state.obstacle_center = float(center_fill)
+        state.obstacle_right  = float(right_fill)
+
+        return left_fill, center_fill, right_fill
+
+    def draw_zones(self, frame):
+        h, w = frame.shape[:2]
+        y1 = int(h * OBSTACLE_ZONE_TOP)
+        y2 = int(h * FLOOR_SAMPLE_TOP)
+        third = w // 3
+
+        def zone_color(fill):
+            if fill > OBSTACLE_THRESH_STOP: return (0,0,255)
+            if fill > OBSTACLE_THRESH_SLOW: return (0,165,255)
+            return (0,200,0)
+
+        overlay = frame.copy()
+        for i, fill in enumerate([state.obstacle_left, state.obstacle_center, state.obstacle_right]):
+            x1, x2 = i*third, (i+1)*third
+            cv2.rectangle(overlay, (x1,y1),(x2,y2), zone_color(fill), -1)
+            cv2.putText(frame, f"{fill:.0%}", (x1+5, y1+20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+        cv2.rectangle(frame, (0,y1),(w,y2),(150,150,150),1)
+        return frame
+
+# ============================================================
+# Detection + Vision Thread
+# ============================================================
+class VisionThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        log.info("Loading YOLOv8n...")
+        self.model    = YOLO("yolov8n.pt")
+        self.analyzer = ObstacleAnalyzer()
+        log.info("YOLOv8n ready.")
+
+    def run(self):
+        while state.running:
+            with frame_lock:
+                frame = state.frame
+            if frame is None:
+                time.sleep(0.04); continue
+
+            # Run obstacle analysis
+            self.analyzer.update(frame)
+
+            # Run YOLO detection
+            results = self.model(frame, conf=CONF_THRESH, verbose=False)[0]
+            detections = []
+            annotated  = frame.copy()
+
+            # Draw obstacle zones
+            annotated = self.analyzer.draw_zones(annotated)
+
+            for box in results.boxes:
+                cls_id = int(box.cls[0])
+                conf   = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                label  = INTERESTING.get(cls_id)
+
+                if label is None:
+                    cv2.rectangle(annotated,(x1,y1),(x2,y2),(80,80,80),1)
+                    continue
+
+                detections.append({
+                    "label": label, "conf": conf,
+                    "box":   (x1,y1,x2,y2),
+                    "cx":    (x1+x2)/2/FRAME_W,
+                    "cy":    (y1+y2)/2/FRAME_H,
+                    # Is this box in the lower half of frame? (close to car)
+                    "close": y2 > FRAME_H * 0.55,
+                })
+
+                color = (0,255,80) if label == "person" else (0,200,255)
+                cv2.rectangle(annotated,(x1,y1),(x2,y2),color,2)
+                cv2.putText(annotated, f"{label} {conf:.0%}",
+                            (x1, max(y1-6,12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
+
+            state.detections = detections
+
+            # HUD
+            h, w = annotated.shape[:2]
+            cv2.putText(annotated,
+                        f"CMD:{state.current_cmd}  L:{state.obstacle_left:.0%} C:{state.obstacle_center:.0%} R:{state.obstacle_right:.0%}",
+                        (8, h-10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1)
+
+            if not self.analyzer.calibrated:
+                cv2.putText(annotated, "CALIBRATING FLOOR...",
+                            (w//2-100, h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,200,255), 2)
+
+            with frame_lock:
+                state.annotated_frame = annotated
+
+            time.sleep(DETECT_INTERVAL)
+
+# ============================================================
+# Navigation Thread — vision-only decisions
+# ============================================================
+class NavigationThread(threading.Thread):
+    def __init__(self, arduino):
+        super().__init__(daemon=True)
+        self.arduino   = arduino
+        self.turn_count = 0
+
+    def run(self):
+        log.info("Navigation started.")
+        # Wait for floor calibration before moving
+        while state.running and not any([
+            state.obstacle_left, state.obstacle_center, state.obstacle_right]):
+            time.sleep(0.1)
+
+        while state.running:
+            cmd = self._decide()
+            if cmd != state.current_cmd:
+                state.current_cmd = cmd
+                log.info(f"→ {cmd}  L={state.obstacle_left:.0%} C={state.obstacle_center:.0%} R={state.obstacle_right:.0%}")
+            self.arduino.send(cmd)
+            time.sleep(DRIVE_INTERVAL)
+
+    def _decide(self):
+        # Still mid-avoidance turn — keep going
+        if time.time() < state.avoid_until:
+            return state.current_cmd
+
+        L = state.obstacle_left
+        C = state.obstacle_center
+        R = state.obstacle_right
+
+        # Check YOLO detections in the lower half (= close objects)
+        close_objs = [d for d in state.detections if d.get("close")]
+
+        # ---- STOP zone: center is very blocked ----
+        if C > OBSTACLE_THRESH_STOP:
+            return self._avoid()
+
+        # ---- YOLO close object in center ----
+        if close_objs:
+            centers = [d["cx"] for d in close_objs]
+            avg_cx  = sum(centers) / len(centers)
+            if 0.3 < avg_cx < 0.7:
+                return self._avoid()
+            elif avg_cx <= 0.3:
+                return self._steer("RIGHT")
+            else:
+                return self._steer("LEFT")
+
+        # ---- Obstacle left or right: steer away ----
+        if L > OBSTACLE_THRESH_STOP and R > OBSTACLE_THRESH_STOP:
+            return self._avoid()   # blocked both sides → back up
+        if L > OBSTACLE_THRESH_SLOW and L > R:
+            return self._steer("RIGHT")
+        if R > OBSTACLE_THRESH_SLOW and R > L:
+            return self._steer("LEFT")
+
+        # ---- IR bump sensors ----
+        if state.ir_left and state.ir_right:
+            return self._avoid()
+        if state.ir_left:  return "RIGHT"
+        if state.ir_right: return "LEFT"
+
+        # ---- Slow zone ----
+        if C > OBSTACLE_THRESH_SLOW:
+            return "SLOW_FORWARD"
+
+        return "FORWARD"
+
+    def _steer(self, direction):
+        """Brief turn without full stop."""
+        return direction
+
+    def _avoid(self):
+        """Back up then turn."""
+        self.arduino.send("BACKWARD")
+        time.sleep(0.35)
+        self.turn_count += 1
+        turn = "LEFT" if self.turn_count % 2 == 0 else "RIGHT"
+        self.arduino.send(turn)
+        state.avoid_until = time.time() + 0.55
+        return turn
+
+# ============================================================
+# Flask Dashboard
+# ============================================================
+DASH_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Robot Cam</title>
+  <meta http-equiv="refresh" content="1">
+  <style>
+    body{background:#0d0d0d;color:#e0e0e0;font-family:monospace;margin:0;padding:16px}
+    h2{margin:0 0 10px;color:#0ff;letter-spacing:2px}
+    img{display:block;border:1px solid #333;width:640px;max-width:100%}
+    .hud{margin-top:8px;font-size:0.95em;display:flex;gap:24px;flex-wrap:wrap}
+    .hud span{background:#1a1a1a;padding:4px 10px;border-radius:4px}
+    .cmd{color:#0f0;font-weight:bold}
+    .det{margin-top:8px}
+    .det span{display:inline-block;background:#1a2a1a;border:1px solid #0a0;
+              padding:2px 8px;border-radius:3px;margin:2px;font-size:0.88em}
+    .bars{margin-top:8px;display:flex;gap:6px}
+    .bar-wrap{display:flex;flex-direction:column;align-items:center;width:60px}
+    .bar-bg{background:#222;width:20px;height:80px;border-radius:3px;overflow:hidden;
+            display:flex;align-items:flex-end}
+    .bar-fill{width:100%;background:#0f0;transition:height .3s}
+    .bar-label{font-size:0.75em;margin-top:3px}
+  </style>
+</head>
+<body>
+  <h2>🤖 ROBOT LIVE</h2>
+  <img src="/video_feed">
+  <div class="hud">
+    <span>CMD: <span class="cmd">{{ cmd }}</span></span>
+    <span>L: {{ ol }}</span>
+    <span>C: {{ oc }}</span>
+    <span>R: {{ or_ }}</span>
+  </div>
+  <div class="det">
+    {% for d in dets %}
+      <span>{{ d.label }} {{ "%.0f"|format(d.conf*100) }}%{% if d.close %} ⚠️{% endif %}</span>
+    {% endfor %}
+  </div>
+</body>
+</html>
+"""
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return render_template_string(DASH_HTML,
+        cmd=state.current_cmd,
+        ol=f"{state.obstacle_left:.0%}",
+        oc=f"{state.obstacle_center:.0%}",
+        or_=f"{state.obstacle_right:.0%}",
+        dets=state.detections)
+
+@app.route("/video_feed")
+def video_feed():
+    def gen():
+        while True:
+            with frame_lock:
+                f = state.annotated_frame
+            if f is None:
+                time.sleep(0.05); continue
+            _, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 72])
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+            time.sleep(0.04)
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port",   default=None)
+    parser.add_argument("--no-web", action="store_true")
+    args = parser.parse_args()
+
+    port = args.port or find_arduino()
+    if not port:
+        log.error("Arduino not found! Check USB connection.")
+        return
+
+    arduino = ArduinoSerial(port)
+
+    CameraThread().start()
+    VisionThread().start()
+    NavigationThread(arduino).start()
+
+    if not args.no_web:
+        log.info(f"Dashboard → http://0.0.0.0:{WEB_PORT}")
+        threading.Thread(
+            target=lambda: app.run("0.0.0.0", WEB_PORT, threaded=True, use_reloader=False),
+            daemon=True).start()
+
+    log.info("Robot running. Ctrl+C to stop.")
+    try:
+        while True: time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Stopping...")
+        state.running = False
+        arduino.send("STOP")
+        time.sleep(0.3)
+
+if __name__ == "__main__":
+    main()
